@@ -8,6 +8,7 @@ import sys
 import io
 import time
 import warnings
+import requests
 from datetime import datetime, timedelta
 import akshare as ak
 from data_source_manager import data_source_manager
@@ -35,6 +36,20 @@ def _setup_stdout_encoding():
                 pass
 
 _setup_stdout_encoding()
+
+# ============================================================
+# 资金流向数据源配置
+# ============================================================
+# 东方财富个股资金流向接口（akshare 内部硬编码的 ut token 已失效，
+# 导致服务器 RemoteDisconnected，这里改用当前可用的 token 直连）
+EASTMONEY_FUND_FLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+EASTMONEY_UT_TOKENS = [
+    "fa5fd1943c7b386f172d6893dbfba10b",
+    "7eea3edcaed734bea9cbfc24409ed989",
+]
+
+# 新浪个股资金流向接口（无需 token，作为东方财富被限流时的备用源）
+SINA_FUND_FLOW_URL = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_lscjfb"
 
 
 class FundFlowAkshareDataFetcher:
@@ -112,29 +127,44 @@ class FundFlowAkshareDataFetcher:
             return 'sz'
     
     def _get_individual_fund_flow(self, symbol, market):
-        """获取个股资金流向数据（支持akshare和tushare自动切换）"""
+        """获取个股资金流向数据（东方财富直连 → akshare → 新浪 → tushare 多级降级）"""
         try:
-            # 优先使用akshare的stock_individual_fund_flow接口（带重试）
-            akshare_df = None
-            for retry_count in range(3):
+            df = None
+
+            # 1) 直连东方财富接口（修复 akshare 内置 ut token 失效问题）
+            try:
+                df = self._fetch_eastmoney_fund_flow(symbol, market)
+                if df is not None and not df.empty:
+                    print(f"   [东方财富] 获取到 {len(df)} 条资金流向数据")
+            except Exception as e:
+                print(f"   [东方财富] 获取失败: {e}")
+
+            # 2) 东方财富失败，退回 akshare 原接口（token 可能随版本更新）
+            if df is None or df.empty:
+                for retry_count in range(2):
+                    try:
+                        print(f"   [Akshare] 正在获取资金流向 (市场: {market})..." +
+                              (f" (第{retry_count+1}次)" if retry_count > 0 else ""))
+                        df = ak.stock_individual_fund_flow(stock=symbol, market=market)
+                        if df is not None and not df.empty:
+                            print(f"   [Akshare] 获取到 {len(df)} 条资金流向数据")
+                            break
+                    except Exception as e:
+                        print(f"   [Akshare] 获取失败: {e}")
+                        if retry_count < 1:
+                            time.sleep(2)
+
+            # 3) 东方财富/akshare 均失败，退回新浪资金流向接口
+            if df is None or df.empty:
                 try:
-                    print(f"   [Akshare] 正在获取资金流向 (市场: {market})..." +
-                          (f" (第{retry_count+1}次)" if retry_count > 0 else ""))
-                    
-                    akshare_df = ak.stock_individual_fund_flow(stock=symbol, market=market)
-                    
-                    if akshare_df is not None and not akshare_df.empty:
-                        print(f"   [Akshare] 获取到 {len(akshare_df)} 条资金流向数据")
-                        df = akshare_df
-                        break
+                    df = self._fetch_sina_fund_flow(symbol, market)
+                    if df is not None and not df.empty:
+                        print(f"   [新浪] 获取到 {len(df)} 条资金流向数据")
                 except Exception as e:
-                    print(f"   [Akshare] 获取失败: {e}")
-                    if retry_count < 2:
-                        delay = (retry_count + 1) * 2
-                        print(f"   [Akshare] {delay}s 后重试...")
-                        time.sleep(delay)
-            else:
-                # akshare全部失败，尝试tushare
+                    print(f"   [新浪] 获取失败: {e}")
+
+            # 4) 以上均失败，尝试 tushare
+            if df is None or df.empty:
                 if data_source_manager.tushare_available:
                     try:
                         print(f"   [Tushare] 正在获取资金流向数据...")
@@ -161,13 +191,13 @@ class FundFlowAkshareDataFetcher:
                         print(f"   [Tushare] 获取失败: {te}")
                         return None
                 else:
-                    print("   [Akshare] 资金流向数据不可用（东方财富接口受限）")
+                    print("   [资金流向] 所有数据源均不可用（东方财富接口受限且未配置 Tushare Token）")
                     return None
-            
+
             # 处理数据
             df = df.tail(self.days)
             df = df.iloc[::-1].reset_index(drop=True)
-            
+
             data_list = []
             for idx, row in df.iterrows():
                 item = {}
@@ -184,7 +214,7 @@ class FundFlowAkshareDataFetcher:
                         item[col] = "N/A"
                 if item:
                     data_list.append(item)
-            
+
             return {
                 "data": data_list,
                 "days": len(data_list),
@@ -192,13 +222,121 @@ class FundFlowAkshareDataFetcher:
                 "market": market,
                 "query_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
-            
+
         except Exception as e:
             print(f"   获取资金流向数据异常: {e}")
             import traceback
             traceback.print_exc()
             return None
-    
+
+    def _fetch_eastmoney_fund_flow(self, symbol, market):
+        """直连东方财富个股资金流向接口，返回与 akshare 相同结构的数据。
+
+        akshare 的 stock_individual_fund_flow 硬编码了过期的 ut token，
+        会被东财服务器直接断开连接（RemoteDisconnected）；这里改用可用 token 直连。
+        """
+        market_map = {"sh": 1, "sz": 0, "bj": 0}
+        params = {
+            "lmt": "0",
+            "klt": "101",
+            "secid": f"{market_map.get(market, 0)}.{symbol}",
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+            "_": int(time.time() * 1000),
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://data.eastmoney.com/zjlx/detail.html",
+        }
+
+        last_exc = None
+        for ut in EASTMONEY_UT_TOKENS:
+            try:
+                params["ut"] = ut
+                r = requests.get(EASTMONEY_FUND_FLOW_URL, params=params, headers=headers, timeout=15)
+                data_json = r.json()
+                content_list = data_json["data"]["klines"]
+                if not content_list:
+                    last_exc = ValueError("接口返回空数据")
+                    continue
+                temp_df = pd.DataFrame([item.split(",") for item in content_list])
+                temp_df.columns = [
+                    "日期", "主力净流入-净额", "小单净流入-净额", "中单净流入-净额",
+                    "大单净流入-净额", "超大单净流入-净额", "主力净流入-净占比",
+                    "小单净流入-净占比", "中单净流入-净占比", "大单净流入-净占比",
+                    "超大单净流入-净占比", "收盘价", "涨跌幅", "-", "-",
+                ]
+                temp_df = temp_df[[
+                    "日期", "收盘价", "涨跌幅", "主力净流入-净额", "主力净流入-净占比",
+                    "超大单净流入-净额", "超大单净流入-净占比", "大单净流入-净额",
+                    "大单净流入-净占比", "中单净流入-净额", "中单净流入-净占比",
+                    "小单净流入-净额", "小单净流入-净占比",
+                ]]
+                temp_df["日期"] = pd.to_datetime(temp_df["日期"], errors="coerce").dt.date
+                for col in ["主力净流入-净额", "小单净流入-净额", "中单净流入-净额",
+                            "大单净流入-净额", "超大单净流入-净额", "主力净流入-净占比",
+                            "小单净流入-净占比", "中单净流入-净占比", "大单净流入-净占比",
+                            "超大单净流入-净占比", "收盘价", "涨跌幅"]:
+                    temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
+                return temp_df
+            except Exception as e:
+                last_exc = e
+                continue
+
+        raise last_exc or RuntimeError("东方财富资金流向接口全部 token 失败")
+
+    def _fetch_sina_fund_flow(self, symbol, market):
+        """从新浪获取个股资金流向数据，映射为与东方财富相同结构的数据。
+
+        新浪接口无需 token，作为东方财富被限流/屏蔽时的备用源。
+        字段映射：r0_net=超大单, r1_net=大单, r2_net=中单, r3_net=小单；
+        主力净额 = 超大单 + 大单。
+        """
+        sina_market = market if market in ("sh", "sz") else ("sh" if symbol.startswith("6") else "sz")
+        daima = f"{sina_market}{symbol}"
+        params = {"page": 1, "num": self.days, "sort": "opendate", "asc": 0, "daima": daima}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://finance.sina.com.cn/",
+        }
+        r = requests.get(SINA_FUND_FLOW_URL, params=params, headers=headers, timeout=15)
+        rows = r.json()
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("新浪资金流向接口返回空数据")
+
+        def _f(row, key):
+            try:
+                return float(row.get(key))
+            except (TypeError, ValueError):
+                return None
+
+        records = []
+        for row in rows:
+            r0 = _f(row, "r0_net")
+            r1 = _f(row, "r1_net")
+            r2 = _f(row, "r2_net")
+            r3 = _f(row, "r3_net")
+            main = (r0 if r0 is not None else 0) + (r1 if r1 is not None else 0)
+            change = _f(row, "changeratio")
+            records.append({
+                "日期": row.get("opendate"),
+                "收盘价": _f(row, "trade"),
+                "涨跌幅": (round(change * 100, 2) if change is not None else None),
+                "主力净流入-净额": main,
+                "主力净流入-净占比": None,
+                "超大单净流入-净额": r0,
+                "超大单净流入-净占比": None,
+                "大单净流入-净额": r1,
+                "大单净流入-净占比": None,
+                "中单净流入-净额": r2,
+                "中单净流入-净占比": None,
+                "小单净流入-净额": r3,
+                "小单净流入-净占比": None,
+            })
+        df = pd.DataFrame(records)
+        df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.date
+        return df
+
     def format_fund_flow_for_ai(self, data):
         """
         将资金流向数据格式化为适合AI阅读的文本
