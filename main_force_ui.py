@@ -372,7 +372,10 @@ def display_recommendation_detail(rec: dict):
             # 显示行业
             industry_keys = [k for k in stock_data.keys() if '行业' in k]
             if industry_keys:
-                st.metric("所属行业", stock_data.get(industry_keys[0], 'N/A'))
+                industry_value = stock_data.get(industry_keys[0], 'N/A')
+                if isinstance(industry_value, list):
+                    industry_value = "、".join(str(x) for x in industry_value) or "N/A"
+                st.metric("所属行业", industry_value)
 
         with col2:
             # 显示主力资金
@@ -898,7 +901,12 @@ def display_main_force_batch_results(batch_results):
                     st.metric("信心度", final_decision.get('confidence_level', 'N/A'))
 
                 with col2:
-                    st.metric("进场区间", final_decision.get('entry_range', 'N/A'))
+                    entry_range = final_decision.get('entry_range', 'N/A')
+                    if isinstance(entry_range, dict):
+                        entry_range = f"{entry_range.get('min', '?')} - {entry_range.get('max', '?')}"
+                    elif isinstance(entry_range, (list, tuple)):
+                        entry_range = " - ".join(str(x) for x in entry_range) or "N/A"
+                    st.metric("进场区间", entry_range)
 
                 with col3:
                     st.metric("目标价", final_decision.get('target_price', 'N/A'))
